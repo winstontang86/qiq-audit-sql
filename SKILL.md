@@ -43,6 +43,10 @@ python3 ${SKILL_DIR}/scripts/audit_sql.py <目标路径...> [选项]
 - `--strict`：把【推荐】级违规也作为阻断条件（合流门禁场景）
 - `--format json`：机器可读 JSON
 - `-o <file>`：写入文件
+- `--diff [REF]`：**行粒度增量模式**。只报告落在 git diff 新增/修改行上的违规。
+  - 不带 REF：检查工作区相对 HEAD 的改动（已暂存 + 未暂存 + 未跟踪整文件）。
+  - 带 REF：透传给 `git diff <REF>`，例如 `--diff HEAD~1`、`--diff origin/master...HEAD`。
+  - 每次执行的中间产物落在 **被检查仓库根目录** 的 `.qiqskills/audit-sql/` 下：`diff.patch`、`changed-lines.json`、`report.{md,json}`。已在 `.gitignore` 中默认忽略。
 
 退出码：`0`=通过；`1`=有【必须】违规（或 `--strict` 下任意违规）；`2`=参数错误。
 
@@ -95,6 +99,12 @@ python3 scripts/audit_sql.py services/ --strict
 
 # 输出 JSON 供上游工具消费
 python3 scripts/audit_sql.py . --format json -o /tmp/audit.json
+
+# 行粒度增量：只检查工作区未提交的改动
+python3 scripts/audit_sql.py . --diff
+
+# 行粒度增量：只检查相对某个基线分支的改动（CI 常用）
+python3 scripts/audit_sql.py . --diff origin/master...HEAD
 ```
 
 ## 自我回归

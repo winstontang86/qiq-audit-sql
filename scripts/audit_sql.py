@@ -26,10 +26,14 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
+
+# skill 工作文件目录（落在被检查仓库根下）
+WORKDIR_NAME = os.path.join(".qiqskills", "audit-sql")
 
 # -------------------- 数据结构 --------------------
 
@@ -406,7 +410,11 @@ class Auditor:
     def audit_block(self, block: SqlBlock):
         cleaned = strip_sql_comments(block.text)
         for stmt_offset, stmt in split_statements(cleaned):
-            line = block.line_of_offset(stmt_offset)
+            # 跳过语句前的空白/换行，拿「语句首个非空字符」对应的行号作为语句起始行。
+            real_offset = stmt_offset
+            while real_offset < len(cleaned) and cleaned[real_offset] in (" ", "\t", "\r", "\n"):
+                real_offset += 1
+            line = block.line_of_offset(real_offset)
             self._audit_statement(stmt, block.file, line)
 
     def _audit_statement(self, stmt: str, file: str, line: int):
@@ -1040,9 +1048,198 @@ def file_to_blocks(p: Path) -> list[SqlBlock]:
     return []
 
 
+# -------------------- Git Diff（增量模式） --------------------
+
+class DiffError(RuntimeError):
+    pass
+
+
+def _run_git(args: list[str], cwd: Path) -> str:
+    try:
+        out = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return out.stdout
+    except FileNotFoundError as e:
+        raise DiffError("未找到 git 可执行文件，无法启用增量模式。") from e
+    except subprocess.CalledProcessError as e:
+        raise DiffError(
+            f"git 命令执行失败: git {' '.join(args)}\nstderr: {e.stderr.strip()}"
+        ) from e
+
+
+def find_repo_root(paths: list[str]) -> Path:
+    """从用户传入的目标路径找 git 仓库根。优先用第一个路径所在目录向上找。"""
+    if not paths:
+        raise DiffError("未提供检查目标路径。")
+    anchor = Path(paths[0]).resolve()
+    if anchor.is_file():
+        anchor = anchor.parent
+    out = _run_git(["rev-parse", "--show-toplevel"], anchor)
+    root = out.strip()
+    if not root:
+        raise DiffError(f"路径 {anchor} 不在 git 仓库内，无法启用增量模式。")
+    return Path(root)
+
+
+def parse_unified_diff(diff_text: str) -> dict[str, set[int]]:
+    """解析 git diff（unified=0）输出，返回 {绝对路径或仓库相对路径 → 新增行号集合}。
+
+    - 删除的文件：跳过（不出现在结果里）。
+    - 二进制文件：跳过。
+    - 新增的整文件：所有行都视为新增。
+    """
+    changed: dict[str, set[int]] = {}
+    cur_file: str | None = None
+    skip_current = False
+    lines = diff_text.splitlines()
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if line.startswith("diff --git "):
+            cur_file = None
+            skip_current = False
+            # 预读后续 header，决定文件名与是否跳过
+            j = i + 1
+            new_path: str | None = None
+            is_binary = False
+            is_deleted = False
+            while j < n and not lines[j].startswith("diff --git ") and not lines[j].startswith("@@"):
+                hl = lines[j]
+                if hl.startswith("deleted file mode"):
+                    is_deleted = True
+                elif hl.startswith("Binary files ") or hl.startswith("GIT binary patch"):
+                    is_binary = True
+                elif hl.startswith("+++ "):
+                    target = hl[4:].strip()
+                    if target == "/dev/null":
+                        is_deleted = True
+                    else:
+                        # 形如 b/path/to/file
+                        new_path = target[2:] if target.startswith("b/") else target
+                j += 1
+            if is_deleted or is_binary or not new_path:
+                skip_current = True
+            else:
+                cur_file = new_path
+                changed.setdefault(cur_file, set())
+            i = j
+            continue
+        if line.startswith("@@") and cur_file and not skip_current:
+            # @@ -a,b +c,d @@  其中 ,b / ,d 可省略（默认 1）
+            m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
+            if m:
+                start = int(m.group(1))
+                count = int(m.group(2)) if m.group(2) is not None else 1
+                if count > 0:
+                    for ln in range(start, start + count):
+                        changed[cur_file].add(ln)
+        i += 1
+    # 清理空集合（纯重命名 / 纯删除）
+    return {k: v for k, v in changed.items() if v}
+
+
+def collect_changed_lines(repo_root: Path, diff_ref: str | None) -> dict[str, set[int]]:
+    """
+    返回 {文件绝对路径 → 新增行号集合}。
+
+    - diff_ref 为 None / "" → 取工作区相对 HEAD 的改动（含未暂存 + 已暂存 + 未跟踪整文件）。
+    - 否则透传给 `git diff <ref> --unified=0` 使用。
+
+    会排除 skill 自身的工作目录 `.qiqskills/`，避免本轮落盘的 patch / report 被当成输入。
+    """
+    changed: dict[str, set[int]] = {}
+    skip_prefix = ".qiqskills/"
+
+    def _merge(other: dict[str, set[int]]):
+        for k, v in other.items():
+            if k.startswith(skip_prefix):
+                continue
+            abspath = str((repo_root / k).resolve())
+            changed.setdefault(abspath, set()).update(v)
+
+    if not diff_ref:
+        # 已暂存
+        cached = _run_git(["diff", "--cached", "--unified=0", "--no-color"], repo_root)
+        _merge(parse_unified_diff(cached))
+        # 未暂存
+        unstaged = _run_git(["diff", "--unified=0", "--no-color"], repo_root)
+        _merge(parse_unified_diff(unstaged))
+        # 未跟踪文件 → 视为整文件新增
+        untracked = _run_git(
+            ["ls-files", "--others", "--exclude-standard"], repo_root
+        ).splitlines()
+        for rel in untracked:
+            rel = rel.strip()
+            if not rel or rel.startswith(skip_prefix):
+                continue
+            fp = (repo_root / rel).resolve()
+            try:
+                if not fp.is_file():
+                    continue
+                line_count = sum(1 for _ in fp.open("rb")) or 1
+            except OSError:
+                continue
+            changed.setdefault(str(fp), set()).update(range(1, line_count + 1))
+    else:
+        out = _run_git(
+            ["diff", diff_ref, "--unified=0", "--no-color"], repo_root
+        )
+        _merge(parse_unified_diff(out))
+    return changed
+
+
+def _raw_diff(repo_root: Path, diff_ref: str | None) -> str:
+    """为留痕保存的 patch 文本（保留正常 unified context，便于人看）。"""
+    if not diff_ref:
+        parts = []
+        parts.append(_run_git(["diff", "--cached", "--no-color"], repo_root))
+        parts.append(_run_git(["diff", "--no-color"], repo_root))
+        return "\n".join(p for p in parts if p)
+    return _run_git(["diff", diff_ref, "--no-color"], repo_root)
+
+
+def filter_findings_by_changed_lines(
+    findings: list[Finding], changed: dict[str, set[int]]
+) -> list[Finding]:
+    """按「文件 + 行号 是否落在新增行集合」过滤 findings。"""
+    if not changed:
+        return []
+    # 把 key 全部规范成 resolved 绝对路径，便于匹配
+    norm: dict[str, set[int]] = {}
+    for k, v in changed.items():
+        try:
+            norm[str(Path(k).resolve())] = v
+        except OSError:
+            norm[k] = v
+    kept: list[Finding] = []
+    for f in findings:
+        try:
+            key = str(Path(f.file).resolve())
+        except OSError:
+            key = f.file
+        lines = norm.get(key)
+        if not lines:
+            continue
+        if f.line and f.line in lines:
+            kept.append(f)
+    return kept
+
+
 # -------------------- 报告输出 --------------------
 
-def render_markdown(findings: list[Finding], scanned_files: list[str], strict: bool) -> str:
+def render_markdown(
+    findings: list[Finding],
+    scanned_files: list[str],
+    strict: bool,
+    diff_info: dict | None = None,
+) -> str:
     must = [f for f in findings if f.level == LEVEL_MUST]
     rec = [f for f in findings if f.level == LEVEL_RECOMMEND]
     lines = []
@@ -1052,6 +1249,12 @@ def render_markdown(findings: list[Finding], scanned_files: list[str], strict: b
     lines.append(f"- 必须级违规：**{len(must)}**")
     lines.append(f"- 推荐级违规：**{len(rec)}**")
     lines.append(f"- 严格模式：**{'是' if strict else '否'}**")
+    if diff_info:
+        ref_show = diff_info.get("ref") or "工作区改动 (HEAD vs working tree + index + untracked)"
+        lines.append(f"- 增量模式：**行粒度**（基于 git diff: `{ref_show}`）")
+        lines.append(
+            f"- 增量涉及文件数：**{diff_info.get('changed_file_count', 0)}**，新增/修改行数：**{diff_info.get('changed_line_count', 0)}**"
+        )
     lines.append("")
     if not findings:
         lines.append("> ✅ 未发现违规，恭喜通过检查。")
@@ -1100,14 +1303,27 @@ def render_markdown(findings: list[Finding], scanned_files: list[str], strict: b
     return "\n".join(lines)
 
 
-def render_json(findings: list[Finding], scanned_files: list[str], strict: bool) -> str:
+def render_json(
+    findings: list[Finding],
+    scanned_files: list[str],
+    strict: bool,
+    diff_info: dict | None = None,
+) -> str:
+    summary = {
+        "scanned_files": len(scanned_files),
+        "must": sum(1 for f in findings if f.level == LEVEL_MUST),
+        "recommend": sum(1 for f in findings if f.level == LEVEL_RECOMMEND),
+        "strict": strict,
+    }
+    if diff_info:
+        summary["diff"] = {
+            "mode": "line",
+            "ref": diff_info.get("ref"),
+            "changed_file_count": diff_info.get("changed_file_count", 0),
+            "changed_line_count": diff_info.get("changed_line_count", 0),
+        }
     return json.dumps({
-        "summary": {
-            "scanned_files": len(scanned_files),
-            "must": sum(1 for f in findings if f.level == LEVEL_MUST),
-            "recommend": sum(1 for f in findings if f.level == LEVEL_RECOMMEND),
-            "strict": strict,
-        },
+        "summary": summary,
         "findings": [f.to_dict() for f in findings],
     }, ensure_ascii=False, indent=2)
 
@@ -1120,10 +1336,97 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--strict", action="store_true", help="严格模式：推荐级违规也阻断退出码")
     parser.add_argument("--format", choices=["md", "json"], default="md", help="报告格式")
     parser.add_argument("-o", "--output", help="输出文件路径（默认 stdout）")
+    parser.add_argument(
+        "--diff",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="REF",
+        help=(
+            "增量模式（行粒度）：只报告落在 git diff 新增/修改行上的违规。"
+            "REF 可省略（=工作区未提交改动），也可为 HEAD~1 / origin/master...HEAD 等任意 git diff 接受的引用。"
+        ),
+    )
     args = parser.parse_args(argv)
 
-    files = list(iter_files(args.paths))
+    # 增量模式准备
+    diff_enabled = args.diff is not None
+    diff_ref: str | None = args.diff if (args.diff not in (None, "")) else None
+    changed_lines: dict[str, set[int]] = {}
+    repo_root: Path | None = None
+    workdir: Path | None = None
+    if diff_enabled:
+        try:
+            repo_root = find_repo_root(args.paths)
+            workdir = repo_root / WORKDIR_NAME
+            workdir.mkdir(parents=True, exist_ok=True)
+            # 落盘 diff patch
+            patch_text = _raw_diff(repo_root, diff_ref)
+            (workdir / "diff.patch").write_text(patch_text, encoding="utf-8")
+            changed_lines = collect_changed_lines(repo_root, diff_ref)
+            # 落盘 changed-lines.json（行号集合转 list）
+            (workdir / "changed-lines.json").write_text(
+                json.dumps(
+                    {
+                        "ref": diff_ref or "",
+                        "repo_root": str(repo_root),
+                        "files": {k: sorted(v) for k, v in changed_lines.items()},
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except DiffError as e:
+            print(f"[--diff] {e}", file=sys.stderr)
+            return 2
+        if not changed_lines:
+            # 没有任何增量改动 → 直接返回 0，但仍写一份空报告
+            empty_info = {
+                "ref": diff_ref,
+                "changed_file_count": 0,
+                "changed_line_count": 0,
+            }
+            if args.format == "md":
+                report = render_markdown([], [], args.strict, empty_info)
+            else:
+                report = render_json([], [], args.strict, empty_info)
+            if args.output:
+                Path(args.output).write_text(report, encoding="utf-8")
+            else:
+                print(report)
+            return 0
+
+    # 选定扫描范围：增量模式下只扫「diff 涉及的文件」交「支持后缀」；否则按 paths 递归。
+    if diff_enabled:
+        files: list[Path] = []
+        for fp_str in changed_lines.keys():
+            fp = Path(fp_str)
+            if not fp.exists() or not fp.is_file():
+                continue
+            ext = fp.suffix.lower()
+            if ext == ".sql" or ext in SOURCE_EXTS:
+                files.append(fp)
+    else:
+        files = list(iter_files(args.paths))
+
     if not files:
+        if diff_enabled:
+            # 增量模式但没有可扫文件（diff 文件都不是 sql/源码）
+            empty_info = {
+                "ref": diff_ref,
+                "changed_file_count": len(changed_lines),
+                "changed_line_count": sum(len(v) for v in changed_lines.values()),
+            }
+            if args.format == "md":
+                report = render_markdown([], [], args.strict, empty_info)
+            else:
+                report = render_json([], [], args.strict, empty_info)
+            if args.output:
+                Path(args.output).write_text(report, encoding="utf-8")
+            else:
+                print(report)
+            return 0
         print("未找到任何 .sql 或源代码文件。", file=sys.stderr)
         return 2
 
@@ -1134,18 +1437,33 @@ def main(argv: list[str]) -> int:
         for block in file_to_blocks(p):
             auditor.audit_block(block)
 
+    findings = auditor.findings
+    diff_info: dict | None = None
+    if diff_enabled:
+        findings = filter_findings_by_changed_lines(findings, changed_lines)
+        diff_info = {
+            "ref": diff_ref,
+            "changed_file_count": len(changed_lines),
+            "changed_line_count": sum(len(v) for v in changed_lines.values()),
+        }
+
     if args.format == "md":
-        report = render_markdown(auditor.findings, scanned, args.strict)
+        report = render_markdown(findings, scanned, args.strict, diff_info)
     else:
-        report = render_json(auditor.findings, scanned, args.strict)
+        report = render_json(findings, scanned, args.strict, diff_info)
 
     if args.output:
         Path(args.output).write_text(report, encoding="utf-8")
     else:
         print(report)
 
-    has_must = any(f.level == LEVEL_MUST for f in auditor.findings)
-    has_any = bool(auditor.findings)
+    # 增量模式下也把报告留痕到工作目录，便于排查
+    if diff_enabled and workdir is not None:
+        ext = "md" if args.format == "md" else "json"
+        (workdir / f"report.{ext}").write_text(report, encoding="utf-8")
+
+    has_must = any(f.level == LEVEL_MUST for f in findings)
+    has_any = bool(findings)
     if has_must:
         return 1
     if args.strict and has_any:
