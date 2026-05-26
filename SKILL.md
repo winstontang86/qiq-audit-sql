@@ -47,14 +47,45 @@ python3 ${SKILL_DIR}/scripts/audit_sql.py <目标路径...> [选项]
   - 不带 REF：检查工作区相对 HEAD 的改动（已暂存 + 未暂存 + 未跟踪整文件）。
   - 带 REF：透传给 `git diff <REF>`，例如 `--diff HEAD~1`、`--diff origin/master...HEAD`。
   - 每次执行的中间产物落在 **被检查仓库根目录** 的 `.qiqskills/audit-sql/` 下：`diff.patch`、`changed-lines.json`、`report.{md,json}`。已在 `.gitignore` 中默认忽略。
+  - **CI / 合流门禁推荐用法**：`--diff origin/master...HEAD --strict`，只阐断本次 PR 新增的违规。
 
 退出码：`0`=通过；`1`=有【必须】违规（或 `--strict` 下任意违规）；`2`=参数错误。
 
 脚本仅依赖 Python 3 标准库，无第三方依赖。
 
+#### 豁免与项目配置（限制噪声）
+
+- **内联豁免注释**（仅识别 SQL 注释里的指令，不识别宿主语言原生注释）：
+  ```sql
+  -- audit-sql:disable-file=1.2.1,1.1.20  reason=upstream keycloak schema
+  -- audit-sql:disable-next-line=1.2.1    reason=月分表占位符
+  CREATE TABLE t_log_YYYYMM (...);
+  ```
+  多个规则号用逗号隔开；`*` 表示所有规则。
+- **项目级配置** `.audit-sql.json`（仓库根目录，脚本会从被检查路径向上查找）：
+  ```json
+  {
+    "column_aliases": {
+      "create_at": ["created_at", "gmt_create"],
+      "update_at": ["updated_at", "gmt_modified"]
+    },
+    "table_name_placeholders": ["_YYYYMM", "_YYYYMMDD"],
+    "excluded_paths": ["**/keycloak-bridge/**", "**/test/fixture/**"]
+  }
+  ```
+  - `column_aliases`：拓宽 1.1.19 必备字段可接受的命名（在内置默认之上合并，内置已含 `created_at/updated_at/gmt_create/gmt_modified/ctime/mtime`）。
+  - `table_name_placeholders`：表名包含该片段时跳过 1.2.1 命名检查。
+  - `excluded_paths`：命中路径的违规在报告中被划入「⚪ 上游/历史兼容」分组（**不豁免**，只是分档提示）。如需真豁免请配合 `disable-file`。
+
 ### Step 3 —— 解读报告
 
-脚本输出已是结构化 Markdown 表格，含：等级（🛑必须 / ⚠️推荐）、规则编号、文件、行号、标题、说明。直接转述给用户。
+脚本输出已是结构化 Markdown 报告，以三档分组呈现：
+
+- 🔴 **真违规**：优先修复；必须级阐断合流。
+- 🟡 **疑似误报**：命中项目配置的占位符等信号。报表会附「处理提示」一列，提示加 `disable-next-line` 或调整 `.audit-sql.json`。
+- ⚪ **上游/历史兼容**：路径命中 `excluded_paths` 或常见上游项目关键字（keycloak/temporal/gitlab…），建议走豁免名单。
+
+表格字段含：等级（🛑必须 / ⚠️推荐）、规则编号、文件、行号、标题、说明。JSON 输出中每条 finding 附 `group` 标签（real / suspect / upstream）。
 
 ### Step 4 —— 补充人工 review
 

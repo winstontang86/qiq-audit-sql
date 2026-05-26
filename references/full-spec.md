@@ -31,7 +31,11 @@
 - **1.1.16【必须】索引禁止走极端**：每个列都建一个单列索引、或建一个覆盖所有列的全列索引，都不允许。
 - **1.1.17【必须】禁止使用外键**。后续修复数据极其复杂。
 - **1.1.18【推荐】表字段数控制在两位数以内（< 99）**。
-- **1.1.19【推荐】表必备字段：`id`, `create_at`, `update_at`**。`id` 必为主键，类型 `bigint unsigned`，未来分库分表用雪花算法或类似生成且保持有序；`create_date`/`update_time` 建议 `datetime`。
+- **1.1.19【推荐】表必备字段：主键 + 创建时间 + 更新时间**。主键叫 `id`（必为主键，类型 `bigint unsigned`，未来分库分表用雪花算法或类似生成且保持有序）；创建/更新时间字段建议 `datetime`，命名接受以下任一**命名族**：
+  - 创建时间：`create_at` / `created_at` / `gmt_create` / `ctime`
+  - 更新时间：`update_at` / `updated_at` / `gmt_modified` / `mtime`
+
+  项目可通过根目录 `.audit-sql.json` 的 `column_aliases` 进一步扩展可接受的别名。
 - **1.1.20【必须】所有字段、表必须带注释**，方便维护与交接。
 
 ### 1.2 命名相关
@@ -106,3 +110,53 @@
 - **6.1【必须】开启审计日志**。现网需要根据审计日志排查 CDB 异常（如不定时 CPU 上涨）。
 - **6.2【必须】新增 RO 组时必须是两个不同可用区的 RO**，防单 AZ 故障。
 - **6.3【必须】主实例必须开启延时 RO**，防异常数据引发内核 bug 导致 CDB 全局故障。
+
+---
+
+## 附录：豁免与项目级配置
+
+### A.1 内联豁免注释
+
+在 SQL 注释（`-- ...` 或 `/* ... */`）中使用以下指令可豁免指定规则。**只识别 SQL 注释，不识别宿主语言（如 Go `// ...`）的原生注释**。
+
+```sql
+-- audit-sql:disable-file=1.2.1,1.1.20  reason=upstream keycloak schema
+/* audit-sql:disable-file=*  reason=test fixture */
+
+-- audit-sql:disable-next-line=1.2.1  reason=月分表占位符
+CREATE TABLE t_log_YYYYMM (...);
+```
+
+- `disable-file=...` ：豁免全文件。
+- `disable-next-line=...` ：仅豁免该注释之下一行起始的 SQL 语句。
+- 规则号可多个逗号分隔；`*` 表示豁免所有规则。
+- `reason=...` 不是必填但强烈建议写上，便于 code review。
+
+### A.2 项目级配置文件 `.audit-sql.json`
+
+放在仓库根目录，脚本会从被检查路径向上递归查找。首版支持以下 3 个字段：
+
+```json
+{
+  "column_aliases": {
+    "create_at": ["created_at", "gmt_create"],
+    "update_at": ["updated_at", "gmt_modified"]
+  },
+  "table_name_placeholders": ["_YYYYMM", "_YYYYMMDD"],
+  "excluded_paths": ["**/keycloak-bridge/**", "**/test/fixture/**"]
+}
+```
+
+- `column_aliases`：扩展 1.1.19 可接受的必备字段别名（在内置默认之上合并）。
+- `table_name_placeholders`：表名中包含该片段时跳过 1.2.1 命名检查（适用于月/日分表占位符）。
+- `excluded_paths`：**不会豁免**，但命中后该文件的违规在报告里会被划入「⚪ 上游/历史兼容」分组，避免息意上动不能动的代码型成阐断噪声。如果要真豁免，请配合 A.1 的 `disable-file`。
+
+### A.3 CI / 合流门禁场景建议用法
+
+```bash
+# 在 PR 上只对本次变更的新增/修改行严格检查
+python3 audit_sql.py . --diff origin/master...HEAD --strict
+```
+
+- 新代码上线需严格合规；历史代码逐步治理，避免被存量违规一次性阐断。
+- 豁免与配置会同步生效于增量检查。

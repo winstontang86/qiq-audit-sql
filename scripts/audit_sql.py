@@ -18,11 +18,29 @@ qiq-audit-sql: DB 规范自动检查脚本
     0 = 通过（无 MUST 违规；--strict 模式下要求无任何违规）
     1 = 存在 MUST 违规（或 --strict 模式下存在任何违规）
     2 = 输入参数错误
+
+豁免与项目配置:
+    - 内联豁免注释（仅识别 SQL 注释里的标记）：
+        -- audit-sql:disable-file=1.2.1,1.1.20  reason=upstream keycloak schema
+        /* audit-sql:disable-file=* reason=test fixture */
+        -- audit-sql:disable-next-line=1.2.1 reason=月分表占位符
+        CREATE TABLE t_log_YYYYMM (...);
+      支持具体规则号、英文逗号分隔多个规则号、`*` 表示全部规则。
+    - 项目级配置：仓库根目录 `.audit-sql.json`，首版字段：
+        {
+          "column_aliases": {
+            "create_at": ["created_at", "gmt_create"],
+            "update_at": ["updated_at", "gmt_modified"]
+          },
+          "table_name_placeholders": ["_YYYYMM", "_YYYYMMDD"],
+          "excluded_paths": ["**/keycloak-bridge/**", "**/test/fixture/**"]
+        }
 """
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -34,6 +52,29 @@ from typing import Iterable
 
 # skill 工作文件目录（落在被检查仓库根下）
 WORKDIR_NAME = os.path.join(".qiqskills", "audit-sql")
+
+# 项目级配置文件名（位于被检查仓库根目录）
+CONFIG_FILE_NAME = ".audit-sql.json"
+
+# 1.1.19 必备语义字段的内置命名族（可被项目配置 column_aliases 扩展）
+# key = 规范中的标准字段名；value = 与之等价的别名集合
+DEFAULT_COLUMN_ALIASES: dict[str, list[str]] = {
+    "id": [],
+    "create_at": ["created_at", "gmt_create", "ctime"],
+    "update_at": ["updated_at", "gmt_modified", "mtime"],
+}
+
+# 路径关键字 → 报告分组提示。命中即把该文件下的 findings 归入「上游/历史兼容」。
+# 这是启发式判定，仅用于报告分档；不会改变规则判定本身。
+UPSTREAM_PATH_HINTS = (
+    "keycloak", "temporal", "gitlab", "camunda", "airflow",
+    "mock-llm", "mock_llm",
+)
+
+# 同样用于报告分档的「测试/fixture」路径启发式。
+TEST_FIXTURE_PATH_HINTS = (
+    "/test/", "/tests/", "/fixture/", "/fixtures/", "/__test__/",
+)
 
 # -------------------- 数据结构 --------------------
 
@@ -72,6 +113,207 @@ class SqlBlock:
 
     def line_of_offset(self, offset: int) -> int:
         return self.start_line + self.text[:offset].count("\n")
+
+
+@dataclass
+class ProjectConfig:
+    """项目级配置（来自 .audit-sql.json，可缺省）。"""
+    # {标准字段名 → 等价别名集合}，已合并默认值
+    column_aliases: dict[str, set[str]] = field(default_factory=dict)
+    # 表名占位符片段（命中时跳过 1.2.1 命名检查），如 "_YYYYMM"
+    table_name_placeholders: list[str] = field(default_factory=list)
+    # 路径 glob，命中视为「上游/历史兼容」，**不豁免**，只用于报告分档
+    excluded_paths: list[str] = field(default_factory=list)
+    # 配置文件来源路径（None = 未找到，使用默认）
+    source_path: str | None = None
+
+    def required_field_aliases(self, std_name: str) -> set[str]:
+        """返回某个必备字段（如 create_at）所有可接受的命名（含自身）。"""
+        names = {std_name.lower()}
+        names.update(a.lower() for a in self.column_aliases.get(std_name, set()))
+        return names
+
+    def is_placeholder_table(self, name: str) -> bool:
+        for ph in self.table_name_placeholders:
+            if not ph:
+                continue
+            if ph in name:
+                return True
+        return False
+
+    def is_excluded(self, file_path: str) -> bool:
+        if not self.excluded_paths:
+            return False
+        norm = file_path.replace("\\", "/")
+        for pat in self.excluded_paths:
+            if fnmatch.fnmatch(norm, pat):
+                return True
+            # 兼容仅给目录前缀的写法
+            if fnmatch.fnmatch(norm, f"*{pat}*"):
+                return True
+        return False
+
+
+def load_project_config(start_paths: list[str]) -> ProjectConfig:
+    """
+    从被检查路径向上查找 `.audit-sql.json`：
+    1) 优先用 git 仓库根；
+    2) 没有 git 时，用第一个路径所在目录向上找直到根。
+    找不到时返回包含默认值的 ProjectConfig。
+    """
+    cfg = ProjectConfig()
+    # 先把内置默认 alias 灌进去（用 set，便于后续 union）
+    for k, v in DEFAULT_COLUMN_ALIASES.items():
+        cfg.column_aliases[k] = set(x.lower() for x in v)
+
+    cfg_path: Path | None = None
+    if start_paths:
+        anchor = Path(start_paths[0]).resolve()
+        if anchor.is_file():
+            anchor = anchor.parent
+        # 1) 试 git root
+        try:
+            out = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=str(anchor),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            root = Path(out.stdout.strip())
+            candidate = root / CONFIG_FILE_NAME
+            if candidate.is_file():
+                cfg_path = candidate
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            pass
+        # 2) 向上找
+        if cfg_path is None:
+            cur = anchor
+            while True:
+                candidate = cur / CONFIG_FILE_NAME
+                if candidate.is_file():
+                    cfg_path = candidate
+                    break
+                if cur.parent == cur:
+                    break
+                cur = cur.parent
+
+    if cfg_path is None:
+        return cfg
+
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[audit-sql] 警告：无法解析配置 {cfg_path}: {e}", file=sys.stderr)
+        return cfg
+
+    cfg.source_path = str(cfg_path)
+    # column_aliases：与默认合并
+    aliases = raw.get("column_aliases") or {}
+    if isinstance(aliases, dict):
+        for std_name, alts in aliases.items():
+            if not isinstance(alts, list):
+                continue
+            cfg.column_aliases.setdefault(std_name, set()).update(
+                a.lower() for a in alts if isinstance(a, str)
+            )
+    # table_name_placeholders
+    phs = raw.get("table_name_placeholders") or []
+    if isinstance(phs, list):
+        cfg.table_name_placeholders = [p for p in phs if isinstance(p, str) and p]
+    # excluded_paths
+    exps = raw.get("excluded_paths") or []
+    if isinstance(exps, list):
+        cfg.excluded_paths = [p for p in exps if isinstance(p, str) and p]
+    return cfg
+
+
+# -------------------- 内联豁免（建议 1） --------------------
+
+# 仅识别 SQL 注释里的豁免标记。形态示例：
+#   -- audit-sql:disable-file=1.2.1,1.1.20 reason=xxx
+#   /* audit-sql:disable-file=* */
+#   -- audit-sql:disable-next-line=1.2.1
+RE_DISABLE_DIRECTIVE = re.compile(
+    r"audit-sql:(disable-file|disable-next-line)\s*=\s*([\w\.\*,\s]+)",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class FileExemptions:
+    """针对单个源文件汇总后的豁免规则（按真实文件行号）。"""
+    file_disabled: set[str] = field(default_factory=set)        # "*" 或 具体规则号
+    line_disabled: dict[int, set[str]] = field(default_factory=dict)  # 行号 → {规则号}
+
+    def covers(self, rule_id: str, line: int) -> bool:
+        if "*" in self.file_disabled or rule_id in self.file_disabled:
+            return True
+        rules = self.line_disabled.get(line)
+        if rules and ("*" in rules or rule_id in rules):
+            return True
+        return False
+
+
+def _parse_disable_rules(raw: str) -> set[str]:
+    items = set()
+    for tok in re.split(r"[,\s]+", raw.strip()):
+        if not tok:
+            continue
+        if tok == "*":
+            items.add("*")
+            continue
+        # 只接受形如 1.2.1 / 2.10 这种规则号；忽略 reason= 等无关 token
+        if re.match(r"^\d+(?:\.\d+){1,3}$", tok):
+            items.add(tok)
+    return items
+
+
+def collect_exemptions(text: str, file: str) -> FileExemptions:
+    """
+    扫描整个源文件文本（.sql 或宿主语言文件均可），
+    抓取 SQL 风格注释里的豁免指令。
+
+    实现策略：直接正则匹配 `-- ...` 与 `/* ... */` 中的 `audit-sql:` 指令。
+    在宿主语言里，宿主自身的注释（如 Go `// ...`）不会被识别——这是有意为之。
+    """
+    ex = FileExemptions()
+
+    # 1) -- 单行注释
+    for m in re.finditer(r"--[^\n]*", text):
+        seg = m.group(0)
+        line_no = text.count("\n", 0, m.start()) + 1
+        for d in RE_DISABLE_DIRECTIVE.finditer(seg):
+            kind = d.group(1).lower()
+            rules = _parse_disable_rules(d.group(2))
+            if not rules:
+                continue
+            if kind == "disable-file":
+                ex.file_disabled.update(rules)
+            else:  # disable-next-line
+                # 「下一行」= 当前注释所在行的 +1（按文件原始行号）
+                target = line_no + 1
+                ex.line_disabled.setdefault(target, set()).update(rules)
+
+    # 2) /* ... */ 多行注释（跨行支持）
+    for m in re.finditer(r"/\*.*?\*/", text, re.DOTALL):
+        seg = m.group(0)
+        start_line = text.count("\n", 0, m.start()) + 1
+        end_line = start_line + seg.count("\n")
+        for d in RE_DISABLE_DIRECTIVE.finditer(seg):
+            kind = d.group(1).lower()
+            rules = _parse_disable_rules(d.group(2))
+            if not rules:
+                continue
+            if kind == "disable-file":
+                ex.file_disabled.update(rules)
+            else:
+                # 「下一行」= 注释结束行 +1
+                target = end_line + 1
+                ex.line_disabled.setdefault(target, set()).update(rules)
+
+    return ex
 
 
 # -------------------- 保留字（精简集，覆盖最常见） --------------------
@@ -400,8 +642,9 @@ def split_columns_block(body: str) -> list[str]:
 # -------------------- 各项检查实现 --------------------
 
 class Auditor:
-    def __init__(self):
+    def __init__(self, config: ProjectConfig | None = None):
         self.findings: list[Finding] = []
+        self.config: ProjectConfig = config or ProjectConfig()
 
     def add(self, f: Finding):
         self.findings.append(f)
@@ -525,8 +768,9 @@ class Auditor:
 
         # 1.1.1 表名保留字
         self._check_reserved_identifier(tbl, "表名", file, line, s)
-        # 1.2.1 表名命名
-        self._check_lower_snake(tbl, "表名", file, line, s)
+        # 1.2.1 表名命名（命中项目配置的占位符片段时跳过，建议 11 的占位符部分顺带在 1.2.1 上生效）
+        if not self.config.is_placeholder_table(tbl):
+            self._check_lower_snake(tbl, "表名", file, line, s)
         # 1.2.4 长度
         if len(tbl) > 32:
             self.add(Finding(
@@ -756,13 +1000,20 @@ class Auditor:
                 f"表 `{tbl}` 字段数 {len(columns)} >= 99，建议拆表。",
                 file, line, _short(s)))
 
-        # 1.1.19 必备字段 id / create_at / update_at
+        # 1.1.19 必备字段 id / create_at / update_at（命名族放宽，详见建议 10）
+        col_names_set = set(col_names_lower)
         for required in ("id", "create_at", "update_at"):
-            if required not in col_names_lower:
+            accepted = self.config.required_field_aliases(required)
+            if not (col_names_set & accepted):
+                # 提示信息明确列出可接受的命名族，避免反复返工
+                if len(accepted) > 1:
+                    hint = "、".join(f"`{n}`" for n in sorted(accepted))
+                    msg = f"表 `{tbl}` 缺少必备字段（语义：`{required}`），可接受的命名任选其一：{hint}。"
+                else:
+                    msg = f"表 `{tbl}` 缺少必备字段 `{required}`。"
                 self.add(Finding(
                     "1.1.19", LEVEL_RECOMMEND, "缺失必备字段",
-                    f"表 `{tbl}` 缺少必备字段 `{required}`。",
-                    file, line, _short(s)))
+                    msg, file, line, _short(s)))
 
         # 表级 ENGINE / CHARSET / COLLATE / COMMENT 检查
         tail_upper = tail.upper()
@@ -1234,12 +1485,68 @@ def filter_findings_by_changed_lines(
 
 # -------------------- 报告输出 --------------------
 
+def _classify_finding(f: Finding, cfg: ProjectConfig) -> str:
+    """返回分组标签：'upstream' / 'suspect' / 'real'。
+
+    仅用于报告分档。不会改变判定本身。
+    """
+    fp = f.file.replace("\\", "/").lower()
+    # 1) 明确命中项目配置 excluded_paths → 上游/历史兼容
+    if cfg and cfg.is_excluded(f.file):
+        return "upstream"
+    # 2) 路径包含上游项目关键字 / 测试 fixture → 上游/历史兼容
+    if any(h in fp for h in UPSTREAM_PATH_HINTS):
+        return "upstream"
+    if any(h in fp for h in TEST_FIXTURE_PATH_HINTS):
+        return "upstream"
+    # 3) 占位符表名相关的常见误报（如果某条违规消息里出现了配置的占位符片段）→ 疑似误报
+    if cfg and cfg.table_name_placeholders:
+        msg_lower = (f.message or "").lower()
+        for ph in cfg.table_name_placeholders:
+            if ph and ph.lower() in msg_lower:
+                return "suspect"
+    return "real"
+
+
+def _hint_for(f: Finding, group: str) -> str:
+    """为分组后的 finding 生成一句「怎么处理」提示。"""
+    if group == "upstream":
+        return (
+            "建议在 `.audit-sql.json` 的 `excluded_paths` 添加该路径，或在文件顶部加 "
+            "`-- audit-sql:disable-file=" + f.rule_id + " reason=upstream` 豁免。"
+        )
+    if group == "suspect":
+        return (
+            "看起来是占位符/别名场景，可在该行紧邻上方加 "
+            "`-- audit-sql:disable-next-line=" + f.rule_id + " reason=...` 豁免。"
+        )
+    return ""
+
+
+def _emit_finding_table(lines: list[str], fs: list[Finding], with_hint: bool, group: str | None):
+    lines.append("| 等级 | 规则 | 行号 | 标题 | 说明 |" + (" 处理提示 |" if with_hint else ""))
+    lines.append("|---|---|---|---|---|" + ("---|" if with_hint else ""))
+    fs_sorted = sorted(fs, key=lambda x: (0 if x.level == LEVEL_MUST else 1, x.rule_id, x.line))
+    for f in fs_sorted:
+        level_label = "🛑 必须" if f.level == LEVEL_MUST else "⚠️ 推荐"
+        msg = f.message.replace("|", "\\|").replace("\n", " ")
+        title = f.title.replace("|", "\\|")
+        if with_hint:
+            hint = _hint_for(f, group or "real").replace("|", "\\|").replace("\n", " ")
+            lines.append(f"| {level_label} | {f.rule_id} | {f.line} | {title} | {msg} | {hint} |")
+        else:
+            lines.append(f"| {level_label} | {f.rule_id} | {f.line} | {title} | {msg} |")
+    lines.append("")
+
+
 def render_markdown(
     findings: list[Finding],
     scanned_files: list[str],
     strict: bool,
     diff_info: dict | None = None,
+    config: ProjectConfig | None = None,
 ) -> str:
+    cfg = config or ProjectConfig()
     must = [f for f in findings if f.level == LEVEL_MUST]
     rec = [f for f in findings if f.level == LEVEL_RECOMMEND]
     lines = []
@@ -1249,6 +1556,8 @@ def render_markdown(
     lines.append(f"- 必须级违规：**{len(must)}**")
     lines.append(f"- 推荐级违规：**{len(rec)}**")
     lines.append(f"- 严格模式：**{'是' if strict else '否'}**")
+    if cfg and cfg.source_path:
+        lines.append(f"- 项目配置：`{cfg.source_path}`")
     if diff_info:
         ref_show = diff_info.get("ref") or "工作区改动 (HEAD vs working tree + index + untracked)"
         lines.append(f"- 增量模式：**行粒度**（基于 git diff: `{ref_show}`）")
@@ -1260,61 +1569,80 @@ def render_markdown(
         lines.append("> ✅ 未发现违规，恭喜通过检查。")
         return "\n".join(lines)
 
-    by_file: dict[str, list[Finding]] = {}
+    # 三档分组（建议 3）：real / suspect / upstream
+    real: list[Finding] = []
+    suspect: list[Finding] = []
+    upstream: list[Finding] = []
     for f in findings:
-        by_file.setdefault(f.file, []).append(f)
+        g = _classify_finding(f, cfg)
+        if g == "upstream":
+            upstream.append(f)
+        elif g == "suspect":
+            suspect.append(f)
+        else:
+            real.append(f)
 
-    lines.append("## 违规清单")
+    lines.append("## 违规概览")
     lines.append("")
-    for file, fs in by_file.items():
-        lines.append(f"### `{file}`")
+    lines.append(f"- 🔴 真违规（建议修复）：**{len(real)}**")
+    lines.append(f"- 🟡 疑似误报（建议加豁免注释）：**{len(suspect)}**")
+    lines.append(f"- ⚪ 上游/历史兼容（建议加入豁免名单）：**{len(upstream)}**")
+    lines.append("")
+
+    def _by_file(group_findings: list[Finding]) -> dict[str, list[Finding]]:
+        out: dict[str, list[Finding]] = {}
+        for f in group_findings:
+            out.setdefault(f.file, []).append(f)
+        return out
+
+    if real:
+        lines.append("## 🔴 真违规")
         lines.append("")
-        lines.append("| 等级 | 规则 | 行号 | 标题 | 说明 |")
-        lines.append("|---|---|---|---|---|")
-        # 排序：MUST 优先，再按规则编号
-        fs_sorted = sorted(fs, key=lambda x: (0 if x.level == LEVEL_MUST else 1, x.rule_id, x.line))
-        for f in fs_sorted:
-            level_label = "🛑 必须" if f.level == LEVEL_MUST else "⚠️ 推荐"
-            msg = f.message.replace("|", "\\|").replace("\n", " ")
-            title = f.title.replace("|", "\\|")
-            lines.append(f"| {level_label} | {f.rule_id} | {f.line} | {title} | {msg} |")
+        for file, fs in _by_file(real).items():
+            lines.append(f"### `{file}`")
+            lines.append("")
+            _emit_finding_table(lines, fs, with_hint=False, group="real")
+
+    if suspect:
+        lines.append("## 🟡 疑似误报（建议加豁免）")
         lines.append("")
-        # snippet 摘要
-        snippets = [f for f in fs_sorted if f.snippet]
-        if snippets:
-            lines.append("<details><summary>语句片段</summary>")
+        for file, fs in _by_file(suspect).items():
+            lines.append(f"### `{file}`")
             lines.append("")
-            seen = set()
-            for f in snippets:
-                key = (f.line, f.snippet)
-                if key in seen:
-                    continue
-                seen.add(key)
-                lines.append(f"- L{f.line} (规则 {f.rule_id}): `{f.snippet}`")
+            _emit_finding_table(lines, fs, with_hint=True, group="suspect")
+
+    if upstream:
+        lines.append("## ⚪ 上游/历史兼容")
+        lines.append("")
+        for file, fs in _by_file(upstream).items():
+            lines.append(f"### `{file}`")
             lines.append("")
-            lines.append("</details>")
-            lines.append("")
+            _emit_finding_table(lines, fs, with_hint=True, group="upstream")
 
     lines.append("## 修复建议")
     lines.append("")
-    lines.append("- 🛑 **必须**类违规阻断合流，请优先修复。")
-    lines.append("- ⚠️ **推荐**类违规请评估后修复；如确有合理理由保留，请在合流说明中注明。")
+    lines.append("- 🔴 **真违规**优先修复（必须级阐断合流）。")
+    lines.append("- 🟡 **疑似误报**：如确认是占位符 / 项目别名场景，加 `audit-sql:disable-next-line=规则号 reason=...` 或调整 `.audit-sql.json`。")
+    lines.append("- ⚪ **上游/历史兼容**：推荐加入 `.audit-sql.json` 的 `excluded_paths` 或 `audit-sql:disable-file=...` ，避免持续噪声。")
     lines.append("- 完整规范见 `references/full-spec.md`，机读 checklist 见 `references/checklist.md`。")
     return "\n".join(lines)
-
 
 def render_json(
     findings: list[Finding],
     scanned_files: list[str],
     strict: bool,
     diff_info: dict | None = None,
+    config: ProjectConfig | None = None,
 ) -> str:
+    cfg = config or ProjectConfig()
     summary = {
         "scanned_files": len(scanned_files),
         "must": sum(1 for f in findings if f.level == LEVEL_MUST),
         "recommend": sum(1 for f in findings if f.level == LEVEL_RECOMMEND),
         "strict": strict,
     }
+    if cfg.source_path:
+        summary["config_path"] = cfg.source_path
     if diff_info:
         summary["diff"] = {
             "mode": "line",
@@ -1322,9 +1650,20 @@ def render_json(
             "changed_file_count": diff_info.get("changed_file_count", 0),
             "changed_line_count": diff_info.get("changed_line_count", 0),
         }
+    # 给每个 finding 附上分组标签，便于上游消费
+    items = []
+    for f in findings:
+        d = f.to_dict()
+        d["group"] = _classify_finding(f, cfg)
+        items.append(d)
+    summary["by_group"] = {
+        "real": sum(1 for d in items if d["group"] == "real"),
+        "suspect": sum(1 for d in items if d["group"] == "suspect"),
+        "upstream": sum(1 for d in items if d["group"] == "upstream"),
+    }
     return json.dumps({
         "summary": summary,
-        "findings": [f.to_dict() for f in findings],
+        "findings": items,
     }, ensure_ascii=False, indent=2)
 
 
@@ -1348,6 +1687,9 @@ def main(argv: list[str]) -> int:
         ),
     )
     args = parser.parse_args(argv)
+
+    # 项目级配置（建议 2）：从被检查路径向上查找 .audit-sql.json
+    project_cfg = load_project_config(args.paths)
 
     # 增量模式准备
     diff_enabled = args.diff is not None
@@ -1388,9 +1730,9 @@ def main(argv: list[str]) -> int:
                 "changed_line_count": 0,
             }
             if args.format == "md":
-                report = render_markdown([], [], args.strict, empty_info)
+                report = render_markdown([], [], args.strict, empty_info, project_cfg)
             else:
-                report = render_json([], [], args.strict, empty_info)
+                report = render_json([], [], args.strict, empty_info, project_cfg)
             if args.output:
                 Path(args.output).write_text(report, encoding="utf-8")
             else:
@@ -1419,9 +1761,9 @@ def main(argv: list[str]) -> int:
                 "changed_line_count": sum(len(v) for v in changed_lines.values()),
             }
             if args.format == "md":
-                report = render_markdown([], [], args.strict, empty_info)
+                report = render_markdown([], [], args.strict, empty_info, project_cfg)
             else:
-                report = render_json([], [], args.strict, empty_info)
+                report = render_json([], [], args.strict, empty_info, project_cfg)
             if args.output:
                 Path(args.output).write_text(report, encoding="utf-8")
             else:
@@ -1430,14 +1772,28 @@ def main(argv: list[str]) -> int:
         print("未找到任何 .sql 或源代码文件。", file=sys.stderr)
         return 2
 
-    auditor = Auditor()
+    auditor = Auditor(config=project_cfg)
     scanned: list[str] = []
+    file_exemptions: dict[str, FileExemptions] = {}
     for p in files:
         scanned.append(str(p))
+        # 先采集豁免指令（建议 1），key 用与 Finding.file 一致的字符串
+        try:
+            file_text = read_text(p)
+            file_exemptions[str(p)] = collect_exemptions(file_text, str(p))
+        except OSError:
+            pass
         for block in file_to_blocks(p):
             auditor.audit_block(block)
 
-    findings = auditor.findings
+    # 应用豁免过滤：仅依赖 finding.file + finding.line
+    raw_findings = auditor.findings
+    findings: list[Finding] = []
+    for f in raw_findings:
+        ex = file_exemptions.get(f.file)
+        if ex and ex.covers(f.rule_id, f.line):
+            continue
+        findings.append(f)
     diff_info: dict | None = None
     if diff_enabled:
         findings = filter_findings_by_changed_lines(findings, changed_lines)
@@ -1448,9 +1804,9 @@ def main(argv: list[str]) -> int:
         }
 
     if args.format == "md":
-        report = render_markdown(findings, scanned, args.strict, diff_info)
+        report = render_markdown(findings, scanned, args.strict, diff_info, project_cfg)
     else:
-        report = render_json(findings, scanned, args.strict, diff_info)
+        report = render_json(findings, scanned, args.strict, diff_info, project_cfg)
 
     if args.output:
         Path(args.output).write_text(report, encoding="utf-8")

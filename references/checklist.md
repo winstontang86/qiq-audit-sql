@@ -31,7 +31,7 @@
 | 1.1.13 | RECOMMEND | DDL | `NOT NULL` 列推荐带 `DEFAULT`（无默认值告警） |
 | 1.1.14 | RECOMMEND | DDL | `timestamp` / `datetime` 列建议有默认值 |
 | 1.1.18 | RECOMMEND | DDL | 表字段数 < 99 |
-| 1.1.19 | RECOMMEND | DDL | 表必备字段：`id`、`create_at`、`update_at` |
+| 1.1.19 | RECOMMEND | DDL | 表必备字段：主键 `id`、创建时间、更新时间（创建/更新时间字段命名接受族：`create_at`/`created_at`/`gmt_create`/`ctime`，`update_at`/`updated_at`/`gmt_modified`/`mtime`，可由 `.audit-sql.json` 扩展） |
 | 1.2.2 | RECOMMEND | DDL | 索引命名：主键 `pk_`、唯一索引 `uk_`、普通索引 `idx_` |
 | 1.2.4 | RECOMMEND | DDL | 库名/表名/列名长度 ≤ 32 字符 |
 | 1.2.5 | RECOMMEND | DDL | 时间类列建议命名后缀：时间戳 `_at`、日期 `_date`、月份 `_month` |
