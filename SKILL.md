@@ -1,6 +1,6 @@
 ---
 name: qiq-audit-sql
-version: 0.1.0
+version: 0.12.0
 description: 业务后台 DB 规范检查 skill。当用户提交 .sql 文件、含嵌入 SQL 的源代码或 DDL/DML 片段，请求 SQL/DB 规范审核、代码 review、合流/上线门禁检查时使用。覆盖建库建表、库表操作、DB 选型、部署监控、安全、生产管理 6 章中的「必须」与「推荐」级条目，自动产出违规清单与修复建议。
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep
 agent_created: true
