@@ -1,6 +1,3 @@
-# Build artifacts
-dist/
-
 # Python
 __pycache__/
 *.pyc
