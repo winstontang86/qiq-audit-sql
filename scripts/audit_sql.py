@@ -379,6 +379,10 @@ SQL_KEYWORDS_FOR_DETECT = re.compile(
     re.IGNORECASE,
 )
 
+# 真正的存储过程/函数调用必须是「CALL 名字(...)」；参数括号在 MySQL / PostgreSQL 中都是强制的。
+# 据此把「call 只是一个英文单词」的字符串（宿主语言错误消息等）排除在规则 2.11 之外。
+RE_CALL_PROC = re.compile(r"CALL\s+[`\"]?[\w$.]+[`\"]?\s*\(")
+
 
 def strip_sql_comments(sql: str) -> str:
     """删除 SQL 注释：-- ... 单行、/* */ 多行、# 单行（hash 注释）。
@@ -685,7 +689,9 @@ class Auditor:
                 "2.11", LEVEL_MUST, "禁止存储过程/函数",
                 "禁止使用存储过程/函数（难调试、难扩展、不可移植）。",
                 file, line, _short(s)))
-        elif re.match(r"CALL\s+\w", upper_head):
+        elif RE_CALL_PROC.match(upper_head):
+            # 必须形如「CALL 过程名(...)」才算存储过程调用（MySQL/PostgreSQL 均要求参数括号），
+            # 避免把宿主语言字符串里的英文单词 call 误判（如 Go: fmt.Errorf("call xxx: %w", err)）。
             self.add(Finding(
                 "2.11", LEVEL_MUST, "禁止 CALL 存储过程",
                 "禁止调用存储过程。",

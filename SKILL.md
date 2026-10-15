@@ -1,6 +1,6 @@
 ---
 name: qiq-audit-sql
-version: 0.12.0
+version: 0.12.1
 description: 业务后台 DB 规范检查 skill。当用户提交 .sql 文件、含嵌入 SQL 的源代码或 DDL/DML 片段，请求 SQL/DB 规范审核、代码 review、合流/上线门禁检查时使用。覆盖建库建表、库表操作、DB 选型、部署监控、安全、生产管理 6 章中的「必须」与「推荐」级条目，自动产出违规清单与修复建议。
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep
 agent_created: true
@@ -145,5 +145,6 @@ python3 scripts/audit_sql.py . --diff origin/master...HEAD
 ```bash
 python3 scripts/audit_sql.py examples/bad.sql     # 期望大量违规、退出码 1
 python3 scripts/audit_sql.py examples/good.sql    # 期望 0 个【必须】违规、退出码 0
-python3 scripts/audit_sql.py examples/sample.go   # 期望识别 Go 中嵌入 SQL
+python3 scripts/audit_sql.py examples/sample.go   # 期望识别 Go 中嵌入 SQL；
+                                                  # 且 fmt.Errorf("call ...: %w") 这类错误字符串不得命中 2.11
 ```
